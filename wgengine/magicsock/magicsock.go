@@ -125,7 +125,6 @@ type Conn struct {
 	packetListener   nettype.PacketListener
 	noteRecvActivity func(tailcfg.DiscoKey) // or nil, see Options.NoteRecvActivity
 	simulatedNetwork bool
-	disableLegacy    bool
 
 	// ================================================================
 	// No locking required to access these fields, either because
@@ -261,28 +260,6 @@ type Conn struct {
 	// with recent activity.
 	endpointOfDisco map[tailcfg.DiscoKey]*discoEndpoint // those with activity only
 	sharedDiscoKey  map[tailcfg.DiscoKey]*[32]byte      // nacl/box precomputed key
-
-	// addrsByUDP is a map of every remote ip:port to a priority
-	// list of endpoint addresses for a peer.
-	// The priority list is provided by wgengine configuration.
-	//
-	// Given a wgcfg describing:
-	//	machineA: 10.0.0.1:1, 10.0.0.2:2
-	//	machineB: 10.0.0.3:3
-	// the addrsByUDP map contains:
-	//	10.0.0.1:1 -> [10.0.0.1:1, 10.0.0.2:2]
-	//	10.0.0.2:2 -> [10.0.0.1:1, 10.0.0.2:2]
-	//	10.0.0.3:3 -> [10.0.0.3:3]
-	//
-	// Used only to communicate with legacy, pre-active-discovery
-	// clients.
-	addrsByUDP map[netaddr.IPPort]*addrSet
-	// addrsByKey maps from public keys (as seen by incoming DERP
-	// packets) to its addrSet (the same values as in addrsByUDP).
-	//
-	// Used only to communicate with legacy, pre-active-discovery
-	// clients.
-	addrsByKey map[key.Public]*addrSet
 
 	// netInfoFunc is a callback that provides a tailcfg.NetInfo when
 	// discovered network conditions change.
@@ -421,11 +398,6 @@ type Options struct {
 	// "go test").
 	SimulatedNetwork bool
 
-	// DisableLegacyNetworking disables legacy peer handling. When
-	// enabled, only active discovery-aware nodes will be able to
-	// communicate with Conn.
-	DisableLegacyNetworking bool
-
 	// LinkMonitor is the link monitor to use.
 	// With one, the portmapper won't be used.
 	LinkMonitor *monitor.Mon
@@ -456,10 +428,7 @@ func (o *Options) derpActiveFunc() func() {
 // of NewConn. Mostly for tests.
 func newConn() *Conn {
 	c := &Conn{
-		disableLegacy:   true,
 		sendLogLimit:    rate.NewLimiter(rate.Every(1*time.Minute), 1),
-		addrsByUDP:      make(map[netaddr.IPPort]*addrSet),
-		addrsByKey:      make(map[key.Public]*addrSet),
 		derpRecvCh:      make(chan derpReadResult),
 		derpStarted:     make(chan struct{}),
 		peerLastDerp:    make(map[key.Public]int),
@@ -488,7 +457,6 @@ func NewConn(opts Options) (*Conn, error) {
 	c.packetListener = opts.PacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
 	c.simulatedNetwork = opts.SimulatedNetwork
-	c.disableLegacy = opts.DisableLegacyNetworking
 	c.portMapper = portmapper.NewClient(logger.WithPrefix(c.logf, "portmapper: "), c.onPortMapChanged)
 	if opts.LinkMonitor != nil {
 		c.portMapper.SetGatewayLookupFunc(opts.LinkMonitor.GatewayAndSelfIP)
@@ -733,35 +701,18 @@ func (c *Conn) pickDERPFallback() int {
 		return 0
 	}
 
-	// See where our peers are.
-	var (
-		peersOnDerp = map[int]int{}
-		best        int
-		bestCount   int
-	)
-	for _, as := range c.addrsByKey {
-		if id := as.derpID(); id != 0 {
-			peersOnDerp[id]++
-			if v := peersOnDerp[id]; v > bestCount {
-				bestCount = v
-				best = id
-			}
-		}
-	}
+	// TODO: figure out which DERP region most of our peers are using,
+	// and use that region as our fallback.
+	//
+	// If we already had selected something in the past and it has any
+	// peers, we want to stay on it. If there are no peers at all,
+	// stay on whatever DERP we previously picked. If we need to pick
+	// one and have no peer info, pick a region randomly.
 
-	// If we already had selected something in the past and it has
-	// any peers, stay on it. If there are no peers, though, also
-	// stay where we are.
-	if c.myDerp != 0 && (best == 0 || peersOnDerp[c.myDerp] != 0) {
+	if c.myDerp != 0 {
 		return c.myDerp
 	}
 
-	// Otherwise pick wherever the most peers are.
-	if best != 0 {
-		return best
-	}
-
-	// Otherwise just pick something randomly.
 	h := fnv.New64()
 	h.Write([]byte(fmt.Sprintf("%p/%d", c, processStartUnixNano))) // arbitrary
 	return ids[rand.New(rand.NewSource(int64(h.Sum64()))).Intn(len(ids))]
@@ -1120,15 +1071,7 @@ func (c *Conn) Send(b []byte, ep conn.Endpoint) error {
 	if c.networkDown() {
 		return errNetworkDown
 	}
-
-	switch v := ep.(type) {
-	default:
-		panic(fmt.Sprintf("[unexpected] Endpoint type %T", v))
-	case *discoEndpoint:
-		return v.send(b)
-	case *addrSet:
-		return c.sendAddrSet(b, v)
-	}
+	return ep.(*discoEndpoint).send(b)
 }
 
 var errConnClosed = errors.New("Conn closed")
@@ -1555,26 +1498,25 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 
 // findEndpoint maps from a UDP address to a WireGuard endpoint, for
 // ReceiveIPv4/ReceiveIPv6.
-//
-// TODO(bradfitz): add a fast path that returns nil here for normal
-// wireguard-go transport packets; wireguard-go only uses this
-// Endpoint for the relatively rare non-data packets; but we need the
-// Endpoint to find the UDPAddr to return to wireguard anyway, so no
-// benefit unless we can, say, always return the same fake UDPAddr for
-// all packets.
 func (c *Conn) findEndpoint(ipp netaddr.IPPort, packet []byte) conn.Endpoint {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// See if they have a discoEndpoint, for a set of peers
-	// both supporting active discovery.
-	if dk, ok := c.discoOfAddr[ipp]; ok {
-		if ep, ok := c.endpointOfDisco[dk]; ok {
-			return ep
-		}
+	dk, ok := c.discoOfAddr[ipp]
+	if !ok {
+		// No idea who this peer IP is.
+		return nil
 	}
-
-	return c.findLegacyEndpointLocked(ipp, packet)
+	ep, ok := c.endpointOfDisco[dk]
+	if !ok {
+		// Received a WireGuard packet from a known disco peer, but
+		// there is no WireGuard endpoint object for it. This means
+		// the wireguard-go code hasn't been told about this peer IP,
+		// even though the disco machinery seems to have picked it as
+		// the preferred datapath.
+		return nil
+	}
+	return ep
 }
 
 // noteRecvActivityFromEndpoint calls the c.noteRecvActivity hook if
@@ -1694,53 +1636,54 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep con
 		return 0, nil
 	}
 
-	var (
-		didNoteRecvActivity bool
-		discoEp             *discoEndpoint
-		asEp                *addrSet
-	)
+	didNoteRecvActivity := false
 	c.mu.Lock()
-	if dk, ok := c.discoOfNode[tailcfg.NodeKey(dm.src)]; ok {
-		discoEp = c.endpointOfDisco[dk]
-		// If we know about the node (it's in discoOfNode) but don't know about the
-		// endpoint, that's because it's an idle peer that doesn't yet exist in the
-		// wireguard config. So run the receive hook, if defined, which should
-		// create the wireguard peer.
-		if discoEp == nil && c.noteRecvActivity != nil {
-			didNoteRecvActivity = true
-			c.mu.Unlock()          // release lock before calling noteRecvActivity
-			c.noteRecvActivity(dk) // (calls back into ParseEndpoint)
-			// Now require the lock. No invariants need to be rechecked; just
-			// 1-2 map lookups follow that are harmless if, say, the peer has
-			// been deleted during this time.
-			c.mu.Lock()
-
-			discoEp = c.endpointOfDisco[dk]
-			c.logf("magicsock: DERP packet received from idle peer %v; created=%v", dm.src.ShortString(), discoEp != nil)
-		}
+	dk, ok := c.discoOfNode[tailcfg.NodeKey(dm.src)]
+	if !ok {
+		// No known endpoint, no activity to record.
+		c.mu.Unlock()
+		return 0, nil
 	}
-	if !c.disableLegacy {
-		asEp = c.addrsByKey[dm.src]
+	discoEp := c.endpointOfDisco[dk]
+	// If we know about the node (it's in discoOfNode) but don't know
+	// about the endpoint, that's because it's an idle peer that
+	// doesn't yet exist in the wireguard config. So run the receive
+	// hook, if defined, which should create the wireguard peer.
+	if discoEp == nil && c.noteRecvActivity != nil {
+		didNoteRecvActivity = true
+		c.mu.Unlock()          // release lock before calling noteRecvActivity
+		c.noteRecvActivity(dk) // (calls back into ParseEndpoint)
+		// Now require the lock. No invariants need to be rechecked; just
+		// 1-2 map lookups follow that are harmless if, say, the peer has
+		// been deleted during this time.
+		c.mu.Lock()
+
+		discoEp = c.endpointOfDisco[dk]
+		c.logf("magicsock: DERP packet received from idle peer %v; created=%v", dm.src.ShortString(), discoEp != nil)
 	}
 	c.mu.Unlock()
 
-	if discoEp != nil {
-		ep = discoEp
-	} else if asEp != nil {
-		ep = asEp
-	} else {
-		key := wgkey.Key(dm.src)
-		c.logf("magicsock: DERP packet from unknown key: %s", key.ShortString())
-		ep = c.findEndpoint(ipp, b[:n])
-		if ep == nil {
-			return 0, nil
-		}
+	if discoEp == nil {
+		// There are a few edge cases where we can still end up with a
+		// nil discoEp here. Among them are: the peer was deleted
+		// while we were unlocked above (harmless, we no longer want
+		// to talk to that peer anyway), or there is a race between
+		// magicsock becoming aware of a new peer and WireGuard
+		// becoming aware, *and* lazy wg reconfiguration is disabled
+		// (at least test code does this, as of 2021-08).
+		//
+		// Either way, the bottom line is: we thought we might know
+		// about this peer, but it turns out we don't know enough to
+		// hand it to WireGuard, so, we want to drop the packet. If
+		// this was in error due to a race, the peer will eventually
+		// retry and heal things.
+		return 0, nil
 	}
 
 	if !didNoteRecvActivity {
-		c.noteRecvActivityFromEndpoint(ep)
+		c.noteRecvActivityFromEndpoint(discoEp)
 	}
-	return n, ep
+	return n, discoEp
 }
 
 // discoLogLevel controls the verbosity of discovery log messages.
@@ -2188,7 +2131,6 @@ func (c *Conn) UpdatePeers(newPeers map[key.Public]struct{}) {
 	// exist.
 	for peer := range oldPeers {
 		if _, ok := newPeers[peer]; !ok {
-			delete(c.addrsByKey, peer)
 			delete(c.derpRoute, peer)
 			delete(c.peerLastDerp, peer)
 		}
@@ -2760,8 +2702,7 @@ func (c *Conn) Rebind() {
 	c.resetEndpointStates()
 }
 
-// resetEndpointStates resets the preferred address for all peers and
-// re-enables spraying.
+// resetEndpointStates resets the preferred address for all peers.
 // This is called when connectivity changes enough that we no longer
 // trust the old routes.
 func (c *Conn) resetEndpointStates() {
@@ -2770,7 +2711,6 @@ func (c *Conn) resetEndpointStates() {
 	for _, de := range c.endpointOfDisco {
 		de.noteConnectivityChange()
 	}
-	c.resetAddrSetStatesLocked()
 }
 
 // packIPPort packs an IPPort into the form wanted by WireGuard.
@@ -2796,16 +2736,18 @@ func (c *Conn) ParseEndpoint(endpointStr string) (conn.Endpoint, error) {
 	var endpoints wgcfg.Endpoints
 	err := json.Unmarshal([]byte(endpointStr), &endpoints)
 	if err != nil {
+		panic("unmarshal")
 		return nil, fmt.Errorf("magicsock: ParseEndpoint: json.Unmarshal failed on %q: %w", endpointStr, err)
 	}
 	pk := key.Public(endpoints.PublicKey)
 	discoKey := endpoints.DiscoKey
-	c.logf("magicsock: ParseEndpoint: key=%s: disco=%s ipps=%s", pk.ShortString(), discoKey.ShortString(), derpStr(endpoints.IPPorts.String()))
+	c.logf("magicsock: ParseEndpoint: key=%s: disco=%s", pk.ShortString(), discoKey.ShortString())
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if discoKey.IsZero() {
-		return c.createLegacyEndpointLocked(pk, endpoints.IPPorts, endpointStr)
+		panic("nodisco")
+		return nil, fmt.Errorf("magicsock: ParseEndpoint: no disco key for key=%s", pk.ShortString())
 	}
 	de := &discoEndpoint{
 		c:             c,
@@ -3099,15 +3041,6 @@ func (c *Conn) UpdateStatus(sb *ipnstate.StatusBuilder) {
 			de.populatePeerStatus(ps)
 		}
 		sb.AddPeer(key.Public(n.Key), ps)
-	}
-	// Old-style (pre-disco) peers:
-	for k, as := range c.addrsByKey {
-		ps := &ipnstate.PeerStatus{
-			InMagicSock: true,
-			Relay:       c.derpRegionCodeOfIDLocked(as.derpID()),
-		}
-		as.populatePeerStatus(ps)
-		sb.AddPeer(k, ps)
 	}
 
 	c.foreachActiveDerpSortedLocked(func(node int, ad activeDerp) {
