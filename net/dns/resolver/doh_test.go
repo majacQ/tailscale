@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"golang.org/x/net/dns/dnsmessage"
+	"inet.af/netaddr"
 )
 
 var testDoH = flag.Bool("test-doh", false, "do real DoH tests against the network")
@@ -48,9 +49,10 @@ func TestDoH(t *testing.T) {
 		dohSem: make(chan struct{}, 10),
 	}
 
-	for ip := range knownDoH {
-		t.Run(ip.String(), func(t *testing.T) {
-			urlBase, c, ok := f.getDoHClient(ip)
+	for ipStr := range knownDoH {
+		t.Run(ipStr, func(t *testing.T) {
+			ip := netaddr.MustParseIP(ipStr)
+			urlBase, c, ok := f.getKnownDoHClient(ip)
 			if !ok {
 				t.Fatal("expected DoH")
 			}
@@ -85,7 +87,8 @@ func TestDoH(t *testing.T) {
 }
 
 func TestDoHV6Fallback(t *testing.T) {
-	for ip, base := range knownDoH {
+	for ipStr, base := range knownDoH {
+		ip := netaddr.MustParseIP(ipStr)
 		if ip.Is4() {
 			ip6, ok := dohV6(base)
 			if !ok {
