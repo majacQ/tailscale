@@ -24,6 +24,7 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"inet.af/netaddr"
+	"tailscale.com/chirp"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
@@ -95,6 +96,8 @@ type userspaceEngine struct {
 	linkMonOwned      bool   // whether we created linkMon (and thus need to close it)
 	linkMonUnregister func() // unsubscribes from changes; used regardless of linkMonOwned
 
+	birdClient *chirp.BIRDClient // or nil
+
 	testMaybeReconfigHook func() // for tests; if non-nil, fires if maybeReconfigWireguardLocked called
 
 	// isLocalAddr reports the whether an IP is assigned to the local
@@ -118,6 +121,7 @@ type userspaceEngine struct {
 	destIPActivityFuncs map[netaddr.IP]func()
 	statusBufioReader   *bufio.Reader // reusable for UAPI
 	lastStatusPollTime  mono.Time     // last time we polled the engine status
+	lastIsSubnetRouter  bool
 
 	mu                  sync.Mutex         // guards following; see lock order comment below
 	netMap              *netmap.NetworkMap // or nil
@@ -173,6 +177,10 @@ type Config struct {
 	// reply to ICMP pings, without involving the OS.
 	// Used in "fake" mode for development.
 	RespondToPing bool
+
+	// BIRDSocket determines whether this engine will configure BIRD
+	// whenever the this node is a primary subnet router.
+	BIRDSocket string
 }
 
 func NewFakeUserspaceEngine(logf logger.Logf, listenPort uint16) (Engine, error) {
@@ -255,6 +263,13 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		tundev:         tsTUNDev,
 		router:         conf.Router,
 		confListenPort: conf.ListenPort,
+	}
+	if conf.BIRDSocket != "" {
+		var err error
+		e.birdClient, err = chirp.New(conf.BIRDSocket)
+		if err != nil {
+			return nil, err
+		}
 	}
 	e.isLocalAddr.Store(tsaddr.NewContainsIPFunc(nil))
 	e.isDNSIPOverTailscale.Store(tsaddr.NewContainsIPFunc(nil))
@@ -754,6 +769,19 @@ func (e *userspaceEngine) updateActivityMapsLocked(trackDisco []tailcfg.DiscoKey
 	e.tundev.SetDestIPActivityFuncs(e.destIPActivityFuncs)
 }
 
+// hasOverlap strictly checks if there is a netaddr.IPPrefix in a that also
+// exists in b. It checks for equality of IPPrefix and not partial overlaps.
+func hasOverlap(a, b []netaddr.IPPrefix) bool {
+	for _, aip := range a {
+		for _, bip := range b {
+			if aip == bip {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config, debug *tailcfg.Debug) error {
 	if routerCfg == nil {
 		panic("routerCfg must not be nil")
@@ -782,9 +810,15 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		listenPort = 0
 	}
 
+	isSubnetRouter := false
+	if e.birdClient != nil {
+		isSubnetRouter = hasOverlap(e.netMap.SelfNode.PrimaryRoutes, e.netMap.Hostinfo.RoutableIPs)
+	}
+	isSubnetRouterChanged := isSubnetRouter != e.lastIsSubnetRouter
+
 	engineChanged := deephash.Update(&e.lastEngineSigFull, cfg)
 	routerChanged := deephash.Update(&e.lastRouterSig, routerCfg, dnsCfg)
-	if !engineChanged && !routerChanged && listenPort == e.magicConn.LocalPort() {
+	if !engineChanged && !routerChanged && listenPort == e.magicConn.LocalPort() && !isSubnetRouterChanged {
 		return ErrNoChanges
 	}
 
@@ -851,6 +885,22 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		health.SetDNSHealth(err)
 		if err != nil {
 			return err
+		}
+	}
+
+	if isSubnetRouterChanged && e.birdClient != nil {
+		e.logf("wgengine: Reconfig: configuring BIRD")
+		var err error
+		if isSubnetRouter {
+			err = e.birdClient.EnableProtocol("tailscale")
+		} else {
+			err = e.birdClient.DisableProtocol("tailscale")
+		}
+		if err != nil {
+			// Log but don't fail here.
+			e.logf("wgengine: Reconfig: error configuring BIRD: %v", err)
+		} else {
+			e.lastIsSubnetRouter = isSubnetRouter
 		}
 	}
 
@@ -1061,6 +1111,9 @@ func (e *userspaceEngine) Close() {
 	e.router.Close()
 	e.wgdev.Close()
 	e.tundev.Close()
+	if e.birdClient != nil {
+		e.birdClient.DisableProtocol("tailscale")
+	}
 	close(e.waitCh)
 }
 
