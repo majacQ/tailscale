@@ -841,7 +841,7 @@ func (r *linuxRouter) addNetfilterBase4() error {
 	// POSTROUTING. So instead, we match on the inbound interface in
 	// filter/FORWARD, and set a packet mark that nat/POSTROUTING can
 	// use to effectively run that same test again.
-	args = []string{"-i", r.tunname, "-j", "MARK", "--set-mark", tailscaleSubnetRouteMark}
+	args = []string{"-i", r.tunname, "-m", "mark", "-j", "MARK", "--set-mark", tailscaleSubnetRouteMark}
 	if err := r.ipt4.Append("filter", "ts-forward", args...); err != nil {
 		return fmt.Errorf("adding %v in v4/filter/ts-forward: %w", args, err)
 	}
@@ -867,7 +867,7 @@ func (r *linuxRouter) addNetfilterBase6() error {
 	// TODO: only allow traffic from Tailscale's ULA range to come
 	// from tailscale0.
 
-	args := []string{"-i", r.tunname, "-j", "MARK", "--set-mark", tailscaleSubnetRouteMark}
+	args := []string{"-i", r.tunname, "-m", "mark", "-j", "MARK", "--set-mark", tailscaleSubnetRouteMark}
 	if err := r.ipt6.Append("filter", "ts-forward", args...); err != nil {
 		return fmt.Errorf("adding %v in v6/filter/ts-forward: %w", args, err)
 	}
