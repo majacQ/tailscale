@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -501,6 +502,9 @@ func (s *Server) UpdateNode(n *tailcfg.Node) (peersToUpdate []tailcfg.NodeID) {
 	if n.Key.IsZero() {
 		panic("zero nodekey")
 	}
+	if n.DiscoKey.IsZero() {
+		panic("zero discokey")
+	}
 	s.nodes[n.Key] = n.Clone()
 	for _, n2 := range s.nodes {
 		if n.ID != n2.ID {
@@ -590,11 +594,12 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey tailcfg.M
 			return // done
 		}
 		// TODO: add minner if/when needed
-		resBytes, err := json.Marshal(res)
+		resBytes, err := json.MarshalIndent(res, "", "  ")
 		if err != nil {
 			s.logf("json.Marshal: %v", err)
 			return
 		}
+		fmt.Fprintf(os.Stderr, "MAPMAPMAP: %s", resBytes)
 		if err := s.sendMapMsg(w, mkey, compress, resBytes); err != nil {
 			return
 		}
