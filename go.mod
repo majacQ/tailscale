@@ -31,13 +31,13 @@ require (
 	github.com/tcnksm/go-httpstat v0.2.0
 	github.com/toqueteos/webbrowser v1.2.0
 	go4.org/mem v0.0.0-20201119185036-c04c5a6ff174
-	golang.org/x/crypto v0.0.0-20210513164829-c07d793c2f9a
-	golang.org/x/net v0.0.0-20210525063256-abc453219eb5
-	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210608053332-aa57babbf139
-	golang.org/x/term v0.0.0-20210503060354-a79de5458b56
+	golang.org/x/crypto v0.1.0
+	golang.org/x/net v0.1.0
+	golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4
+	golang.org/x/sys v0.1.0
+	golang.org/x/term v0.1.0
 	golang.org/x/time v0.0.0-20210220033141-f8bda1e9f3ba
-	golang.org/x/tools v0.1.2
+	golang.org/x/tools v0.1.12
 	golang.zx2c4.com/wireguard v0.0.0-20210525143454-64cb82f2b3f5
 	golang.zx2c4.com/wireguard/windows v0.3.15-0.20210525143335-94c0476d63e3
 	honnef.co/go/tools v0.1.4
